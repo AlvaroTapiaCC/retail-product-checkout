@@ -1,54 +1,27 @@
-# src/training/train_mlp.py
-
-import torch
+import json
+import shutil
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
 from ..models.mlp import MLPClassifier
 from .. import config
 
 from ..data.label_encoder import LabelEncoder
-from ..paths import EMBEDDINGS_PATH, RESULTS_PATH
+from ..paths import (
+    LABEL_ENCODER_PATH,
+    LAST_MODEL_PATH,
+    BEST_MODEL_PATH,
+    LAST_METRICS_PATH,
+    BEST_METRICS_PATH,
+)
 
-from .metrics import get_predictions, compute_all_metrics
-from ..utils.checkpointing import save_checkpoint
+from .metrics import get_predictions, compute_all_metrics, plot_and_save_confusion_matrix
+from .diagnostics import analyze_training, compare_with_best
+from .training_utils import run_epoch, load_embeddings
+from ..utils.model_io import save_model, load_model
 from ..utils.io import save_history, save_metrics, save_config
 
-
-def load_embeddings(path):
-    data = torch.load(path)
-    return TensorDataset(data["embeddings"], data["labels"])
-
-
-def run_epoch(loader, model, criterion, optimizer, device):
-    total_loss = 0
-    correct = 0
-    total = 0
-
-    is_train = optimizer is not None
-    model.train() if is_train else model.eval()
-
-    with torch.set_grad_enabled(is_train):
-        for x, y in loader:
-            x = x.to(device).float()
-            y = y.to(device)
-
-            logits = model(x)
-            loss = criterion(logits, y)
-
-            if is_train:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-            total_loss += loss.item() * x.size(0)
-
-            preds = logits.argmax(dim=1)
-            correct += (preds == y).sum().item()
-            total += x.size(0)
-
-    return total_loss / total, correct / total
 
 
 def train_mlp(train_path, test_path):
@@ -57,33 +30,36 @@ def train_mlp(train_path, test_path):
     train_dataset = load_embeddings(train_path)
     test_dataset = load_embeddings(test_path)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.batch_size,
-        shuffle=False
-    )
+    label_encoder = LabelEncoder.load(LABEL_ENCODER_PATH)
 
-    # 1. LOAD LABEL ENCODER (PERSISTENCE FIX)
-    label_encoder = LabelEncoder.load(
-        EMBEDDINGS_PATH / "label_encoder.json"
-    )
-
-    # 2. INPUT DIM FROM EMBEDDINGS
     input_dim = train_dataset.tensors[0].shape[1]
-
-    # 3. NUM_CLASSES FROM ENCODER (FIX)
     num_classes = label_encoder.num_classes()
 
     model = MLPClassifier(input_dim, num_classes).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    # LOAD BEST GLOBAL (USANDO load_model)
+    best_global_path = BEST_MODEL_PATH / "best.pt"
+    if not config.train_new and best_global_path.exists():
+        model = load_model(model, best_global_path, device)
+        model.eval()
+
+        print("[INFO] Loaded best global model")
+
+        y_true, y_pred = get_predictions(model, test_loader, device)
+        metrics = compute_all_metrics(y_true, y_pred)
+
+        save_metrics(metrics, LAST_METRICS_PATH / "metrics.json")
+        plot_and_save_confusion_matrix(
+            y_true, y_pred, LAST_METRICS_PATH / "confusion_matrix.png"
+        )
+
+        return model, metrics
+
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    criterion = nn.CrossEntropyLoss()
 
     history = {
         "train_loss": [],
@@ -93,18 +69,24 @@ def train_mlp(train_path, test_path):
     }
 
     best_test_acc = 0.0
+    best_model_state = None
+    best_epoch = 0
 
-    # 4. SAVE CONFIG FOR REPRODUCIBILITY
+    LAST_MODEL_PATH.mkdir(parents=True, exist_ok=True)
+    BEST_MODEL_PATH.mkdir(parents=True, exist_ok=True)
+    LAST_METRICS_PATH.mkdir(parents=True, exist_ok=True)
+    BEST_METRICS_PATH.mkdir(parents=True, exist_ok=True)
+
     save_config(
         {
-        "level": config.level,
-        "device": config.device,
-        "batch_size": config.batch_size,
-        "epochs": config.epochs,
-        "lr": config.lr,
-        "model": config.model,
+            "level": config.level,
+            "device": config.device,
+            "batch_size": config.batch_size,
+            "epochs": config.epochs,
+            "lr": config.lr,
+            "model": config.model,
         },
-        RESULTS_PATH / "config.json"
+        LAST_MODEL_PATH / "config.json",
     )
 
     for epoch in range(config.epochs):
@@ -122,33 +104,10 @@ def train_mlp(train_path, test_path):
         history["train_acc"].append(train_acc)
         history["test_acc"].append(test_acc)
 
-        metrics_snapshot = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "test_loss": test_loss,
-            "test_acc": test_acc,
-        }
-
-        # checkpoint last
-        save_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            path=RESULTS_PATH / "checkpoints/last.pt",
-            metrics=metrics_snapshot,
-        )
-
-        # checkpoint best
         if test_acc > best_test_acc:
             best_test_acc = test_acc
-            save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                path=RESULTS_PATH / "checkpoints/best.pt",
-                metrics=metrics_snapshot,
-            )
+            best_model_state = model.state_dict()
+            best_epoch = epoch
 
         print(
             f"Epoch {epoch+1}/{config.epochs} | "
@@ -156,12 +115,56 @@ def train_mlp(train_path, test_path):
             f"test loss {test_loss:.4f} acc {test_acc:.4f}"
         )
 
-    # FINAL EVALUATION
+    model.load_state_dict(best_model_state)
+
+    # SAVE LAST MODEL
+    save_model(model, LAST_MODEL_PATH / "last.pt")
+
     y_true, y_pred = get_predictions(model, test_loader, device)
-    val_metrics = compute_all_metrics(y_true, y_pred)
+    metrics = compute_all_metrics(y_true, y_pred)
 
-    # SAVE RESULTS
-    save_history(history, RESULTS_PATH / "history.json")
-    save_metrics(val_metrics, RESULTS_PATH / "metrics.json")
+    save_history(history, LAST_MODEL_PATH / "history.json")
+    save_metrics(metrics, LAST_METRICS_PATH / "metrics.json")
+    plot_and_save_confusion_matrix(
+        y_true, y_pred, LAST_METRICS_PATH / "confusion_matrix.png"
+    )
+    
+    if config.train_new:
+        status = analyze_training(
+            {
+                "train_acc": [history["train_acc"][best_epoch]],
+                "test_acc": [history["test_acc"][best_epoch]],
+                "train_loss": [history["train_loss"][best_epoch]],
+                "test_loss": [history["test_loss"][best_epoch]],
+            }
+        )
+        print(f"\n[DIAGNOSTIC] {status}")
 
-    return model, val_metrics
+    # COMPARE WITH GLOBAL BEST
+    best_metrics_file = BEST_METRICS_PATH / "metrics.json"
+    best_history_file = BEST_MODEL_PATH / "history.json"
+
+    is_better = True
+    if best_metrics_file.exists() and best_history_file.exists():
+        with open(best_metrics_file, "r") as f:
+            best_metrics = json.load(f)
+        with open(best_history_file, "r") as f:
+                best_history = json.load(f)
+        rel_status = compare_with_best(metrics, best_metrics, history, best_history)
+        print(f"[DIAGNOSTIC] {rel_status}\n")
+        
+        is_better = metrics["accuracy"] > best_metrics["accuracy"]
+
+    if is_better:
+        print("[INFO] New global best  MLP model")
+
+        save_metrics(metrics, BEST_METRICS_PATH / "metrics.json")
+        plot_and_save_confusion_matrix(
+            y_true, y_pred, BEST_METRICS_PATH / "confusion_matrix.png"
+        )
+
+        save_model(model, BEST_MODEL_PATH / "best.pt")
+        shutil.copy(LAST_MODEL_PATH / "history.json", BEST_MODEL_PATH / "history.json")
+        shutil.copy(LAST_MODEL_PATH / "config.json", BEST_MODEL_PATH / "config.json")
+
+    return model, metrics
