@@ -6,6 +6,68 @@ Pipeline de detección y clasificación de productos de supermercado usando DINO
 
 **Dataset:** [Retail Product Checkout Dataset (Kaggle)](https://www.kaggle.com/datasets/diyer22/retail-product-checkout-dataset)
 
+Proyecto del curso Inteligencia Artificial, Universidad de los Andes (Chile), 2026.
+
+**Stack:** Python · PyTorch · DINOv2 · CLIP (ViT-B/32) · scikit-learn · SciPy (Hungarian matching) · UMAP · Matplotlib
+
+---
+
+## Resultados (nivel `easy`)
+
+| Etapa | Métrica | Valor |
+|-------|---------|-------|
+| Clasificador (CLIP + MLP) | Accuracy / F1 (validación) | 98.4% / 0.983 |
+| Detector (DINOv2 + cabeza DETR-style) | MAE de conteo | 0.23 productos |
+| Detector | IoU promedio | 0.107 |
+| Pipeline completo | Accuracy de clasificación sobre detecciones | 81.8% |
+| Pipeline completo | Recall de localización / end-to-end | 40.7% / 33.3% |
+
+El clasificador funciona muy bien. El cuello de botella es la localización del detector, como se detalla en [Desarrollo del proyecto](#desarrollo-del-proyecto).
+
+| Pipeline end-to-end | Matriz de confusión del clasificador |
+|---|---|
+| ![Pipeline](results/pipeline/easy/result_00_20180831-11-44-48-2155.png) | ![Confusion matrix](results/classifier/easy/best/confusion_matrix.png) |
+
+| Detector: GT vs predicción | Métricas del pipeline |
+|---|---|
+| ![Detector](results/detector/easy/best/det_comparison_00.png) | ![Pipeline metrics](results/pipeline/easy/pipeline_metrics.png) |
+
+---
+
+## Instalación
+
+Requiere Python 3.12.
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows  (Linux/macOS: source .venv/bin/activate)
+
+# 1. PyTorch primero. Con GPU NVIDIA (CUDA 13.0):
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+#    Solo CPU:
+# pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
+
+# 2. Resto de dependencias (incluye CLIP de OpenAI desde GitHub)
+pip install -r requirements.txt
+```
+
+DINOv2 se descarga automáticamente desde `torch.hub` la primera vez.
+
+## Uso
+
+1. Descargar el [dataset de Kaggle](https://www.kaggle.com/datasets/diyer22/retail-product-checkout-dataset) y dejarlo en `dataset/` con la estructura indicada más abajo.
+2. Configurar la corrida en `src/config.py`:
+   - `model`: `"classifier"`, `"detector"` o `"pipeline"`
+   - `level`: `"easy"`, `"medium"` o `"hard"`
+   - `encode = True` la primera vez, para precomputar los embeddings de CLIP/DINOv2
+   - `train_new = True` para entrenar desde cero, `False` para cargar el mejor checkpoint
+3. Ejecutar:
+   ```bash
+   python main.py
+   ```
+
+Las métricas, gráficos e imágenes de cada corrida se guardan en `results/<modelo>/<nivel>/`.
+
 ---
 
 ## Estructura del repositorio
@@ -81,7 +143,7 @@ AI-Grupo-9-Proyecto/
     └── pipeline/
 ```
 
-> **dataset/**, **precomputed/**, **checkpoints/** y **results/** no se incluyen en el repositorio (ver `.gitignore`).
+> **dataset/**, **precomputed/** y **checkpoints/** no se incluyen en el repositorio por su tamaño (ver `.gitignore`). **results/** sí se incluye, con las métricas y gráficos de las corridas finales.
 
 ---
 
